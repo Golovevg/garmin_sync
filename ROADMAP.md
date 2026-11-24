@@ -30,3 +30,10 @@ the current application does not yet implement the setup flow below.
 4. Retry incomplete older activities, including missing sets, laps, and FIT files.
 5. Replace ambiguous set-weight unit detection with a verified conversion.
 6. Reconcile intraday samples after Garmin corrects the source data.
+
+## Documentation baseline
+
+Documented the current PostgreSQL initialization, all 23 tables and 177 columns, view mappings,
+Garmin endpoints, parsing rules, checkpoints, exports, backups, scheduling, configuration, and known
+failure cases. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). Documentation does not imply
+that the planned fixes or interactive setup have been implemented.

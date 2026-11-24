@@ -1,8 +1,15 @@
 # Garmin → PostgreSQL → Google Drive (Docker on Mac mini)
 
-The collector retrieves **all** data from Garmin Connect twice a day (09:00 and 22:00 Moscow time):
+The collector retrieves the configured data categories from Garmin Connect twice a day (09:00 and 22:00 Moscow time):
 daily metrics, intraday samples, and activities with exercise sets and FIT files.
 It stores the data in PostgreSQL, exports CSV and FIT files to Google Drive, and backs up the database.
+
+## Detailed documentation
+
+- [Architecture, setup, and application logic](docs/ARCHITECTURE.md)
+- [PostgreSQL data dictionary: every table, field, and relationship](docs/DATABASE.md)
+- [Garmin endpoints and CSV export queries](docs/ENDPOINTS_AND_EXPORTS.md)
+- [Development plan](ROADMAP.md)
 
 ## Database layout
 
@@ -60,14 +67,15 @@ backups/     pg_dump backups for the last 14 days
 ## Sync behavior
 
 - The first version 2 run reprocesses the entire history, starting at the earliest day in the database
-  (or `BACKFILL_FROM`). Approximately 17 requests per day and up to 6 per activity, with delays.
+  (or `BACKFILL_FROM`). 16 daily endpoint requests per date and up to 6 per activity, with delays.
   A 90-day history takes approximately 20–40 minutes.
 - Subsequent runs reload the most recent `RESYNC_DAYS` days and their activities:
   Garmin may sync data with a delay, and set weights can be edited retroactively.
-- HTTP 429 (too many requests): wait 10 minutes, then stop the run;
-  the next run resumes from the same point.
-- Missing metrics (for example, when no scale is connected) are not treated as errors:
-  a single log entry is written and the field remains empty.
+- HTTP 429 (too many requests): wait 10 minutes and retry once. A repeated limit stops
+  that sync phase; later runs resume with the checkpoint overlap.
+- Availability depends on Garmin and the connected device. Missing metrics generally produce empty
+  fields; failed requests can overwrite saved daily data in the current implementation. See the
+  known limitations in the architecture document.
 
 ## Commands
 
