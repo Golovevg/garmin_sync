@@ -1,24 +1,24 @@
 #!/usr/bin/env python3
 """
-Garmin Connect -> PostgreSQL -> CSV и FIT-файлы в Google Drive.   Версия 2: выгрузка «всего».
+Garmin Connect -> PostgreSQL -> CSV and FIT files in Google Drive.   Version 2: full export.
 
-Режимы:
-    python sync.py            # служба: проход по расписанию RUN_TIMES (по умолчанию 09:00 и 22:00)
-    python sync.py --once     # один проход и выход
-    python sync.py --login    # первый вход: email, пароль, код MFA (интерактивно)
-    python sync.py --reparse  # пересобрать таблицы garmin.* из сырых ответов raw.* (без запросов к Garmin)
+Modes:
+    python sync.py            # service: run on the RUN_TIMES schedule (default: 09:00 and 22:00)
+    python sync.py --once     # run once and exit
+    python sync.py --login    # initial login: email, password, MFA code (interactive)
+    python sync.py --reparse  # rebuild garmin.* tables from raw.* responses (without Garmin requests)
 
-Устройство базы:
-    raw.*      — ответы Garmin как есть (jsonb). Источник истины: из него можно пересобрать всё остальное.
-    garmin.*   — разобранные таблицы: по дням, внутри дня, тренировки; плюс представления для выгрузки.
-    legacy.*   — таблицы версии 1 (переносятся сюда автоматически, можно удалить после проверки).
+Database layout:
+    raw.*      — unmodified Garmin responses (jsonb). Source of truth for rebuilding everything else.
+    garmin.*   — parsed tables: daily metrics, intraday samples, activities, and export views.
+    legacy.*   — version 1 tables (moved here automatically; can be removed after verification).
 
-Инкрементальная загрузка:
-    - первый запуск версии 2 заново проходит всю историю (с самого раннего дня в базе или BACKFILL_FROM),
-      потому что раньше собиралась только часть показателей;
-    - дальше каждый проход берёт дни и тренировки от «последний загруженный − RESYNC_DAYS» до сегодня
-      и перезаписывает их, потому что Garmin досинхронизирует данные с опозданием
-      (и потому что веса в подходах можно поправить в Garmin Connect задним числом).
+Incremental sync:
+    - the first version 2 run reprocesses the entire history (from the earliest day in the database or BACKFILL_FROM),
+      because earlier versions collected only a subset of metrics;
+    - subsequent runs fetch days and activities from the last synced date minus RESYNC_DAYS through today
+      and overwrite them because Garmin may sync data with a delay
+      (and because set weights can be edited retroactively in Garmin Connect).
 """
 from __future__ import annotations
 
@@ -52,14 +52,14 @@ RCLONE_REMOTE = os.environ.get("RCLONE_REMOTE", "").strip()
 KEEP_DUMPS = int(os.environ.get("KEEP_DUMPS", "14"))
 DOWNLOAD_FIT = os.environ.get("DOWNLOAD_FIT", "1") == "1"
 
-PAUSE_CALL = 0.4        # секунды между запросами — чтобы не упереться в лимиты Garmin
+PAUSE_CALL = 0.4        # seconds between requests to avoid Garmin rate limits
 PAUSE_DAY = 1.5
 PAUSE_ACTIVITY = 1.0
 RATE_LIMIT_WAIT = 600
 
 
 # =====================================================================
-# служебное
+# utilities
 # =====================================================================
 
 def now() -> dt.datetime:
@@ -78,7 +78,7 @@ def log(msg: str) -> None:
 
 
 def dig(obj: Any, *path: Any) -> Any:
-    """Значение по точному пути: dig(x, "a", 0, "b")."""
+    """Value at an exact path: dig(x, "a", 0, "b")."""
     for p in path:
         if isinstance(obj, dict):
             obj = obj.get(p)
@@ -92,7 +92,7 @@ def dig(obj: Any, *path: Any) -> Any:
 
 
 def find(obj: Any, *keys: str) -> Any:
-    """Первое значение по любому из ключей, ищет рекурсивно. Ноль — тоже значение."""
+    """Recursively find the first value for any of the keys. Zero is a valid value."""
     if isinstance(obj, dict):
         for k in keys:
             v = obj.get(k)
@@ -134,7 +134,7 @@ def grams_to_kg(v: Any) -> float | None:
 
 
 def set_weight_kg(v: Any) -> float | None:
-    """Вес в подходе. Garmin отдаёт граммы; на случай килограммов — значения меньше 1000 оставляем как есть."""
+    """Set weight. Garmin returns grams; values below 1000 are left unchanged in case they are kilograms."""
     n = num(v, 3)
     if n is None:
         return None
@@ -149,7 +149,7 @@ def ms_to_ts(ms: Any) -> dt.datetime | None:
 
 
 def parse_dt(s: Any) -> dt.datetime | None:
-    """'2026-11-13T15:30:00.0' / '2026-11-13 15:30:00' -> datetime без часового пояса."""
+    """'2026-11-13T15:30:00.0' / '2026-11-13 15:30:00' -> datetime without a time zone."""
     if not isinstance(s, str) or not s:
         return None
     s = s.strip().replace("T", " ")
@@ -185,14 +185,14 @@ class RateLimited(Exception):
 
 
 # =====================================================================
-# схема базы
+# database schema
 # =====================================================================
 
 SCHEMA_SQL = r"""
 CREATE SCHEMA IF NOT EXISTS raw;
 CREATE SCHEMA IF NOT EXISTS garmin;
 
--- перенос таблиц версии 1
+-- migrate version 1 tables
 DO $$
 BEGIN
     IF to_regclass('public.raw_daily') IS NOT NULL AND to_regclass('raw.daily') IS NULL THEN
@@ -209,7 +209,7 @@ BEGIN
     END IF;
 END $$;
 
--- ---------- сырые ответы Garmin ----------
+-- ---------- raw Garmin responses ----------
 CREATE TABLE IF NOT EXISTS raw.daily (
     day        date        NOT NULL,
     endpoint   text        NOT NULL,
@@ -225,34 +225,34 @@ CREATE TABLE IF NOT EXISTS raw.activity (
     PRIMARY KEY (activity_id, endpoint)
 );
 
--- ---------- по дням: одна строка на день в каждой таблице ----------
+-- ---------- daily metrics: one row per day in each table ----------
 CREATE TABLE IF NOT EXISTS garmin.sleep (
     day         date PRIMARY KEY,
     sleep_start timestamptz,
     sleep_end   timestamptz,
-    total_s     integer,          -- сон всего, с
+    total_s     integer,          -- total sleep, seconds
     deep_s      integer,
     light_s     integer,
     rem_s       integer,
     awake_s     integer,
-    score       smallint,         -- оценка сна 0–100
+    score       smallint,         -- sleep score, 0–100
     quality     text,             -- EXCELLENT / GOOD / FAIR / POOR
     avg_stress  real,
     hr_avg      smallint,
-    resp_avg    real,             -- дыхание во сне, вдохов/мин
+    resp_avg    real,             -- sleep respiration, breaths/min
     spo2_avg    smallint,
     spo2_min    smallint,
     updated_at  timestamptz NOT NULL DEFAULT now()
 );
 CREATE TABLE IF NOT EXISTS garmin.heart (
     day               date PRIMARY KEY,
-    rhr               smallint,   -- пульс покоя
-    rhr_7d            smallint,   -- пульс покоя, среднее за 7 дней
+    rhr               smallint,   -- resting heart rate
+    rhr_7d            smallint,   -- resting heart rate, 7-day average
     hr_min            smallint,
     hr_max            smallint,
-    hrv_night         smallint,   -- HRV за ночь, мс
-    hrv_night_max5    smallint,   -- лучшие 5 минут ночи
-    hrv_week          smallint,   -- HRV, среднее за 7 дней
+    hrv_night         smallint,   -- nightly HRV, ms
+    hrv_night_max5    smallint,   -- highest 5-minute nightly HRV
+    hrv_week          smallint,   -- HRV, 7-day average
     hrv_status        text,       -- BALANCED / UNBALANCED / LOW / POOR
     hrv_baseline_low  smallint,
     hrv_baseline_high smallint,
@@ -262,13 +262,13 @@ CREATE TABLE IF NOT EXISTS garmin.stress_energy (
     day        date PRIMARY KEY,
     stress_avg smallint,
     stress_max smallint,
-    rest_s     integer,           -- время в покое, с
+    rest_s     integer,           -- time at rest, seconds
     low_s      integer,
     medium_s   integer,
     high_s     integer,
     bb_max     smallint,          -- Body Battery
     bb_min     smallint,
-    bb_wake    smallint,          -- при пробуждении
+    bb_wake    smallint,          -- at wake-up
     bb_charged smallint,
     bb_drained smallint,
     updated_at timestamptz NOT NULL DEFAULT now()
@@ -288,16 +288,16 @@ CREATE TABLE IF NOT EXISTS garmin.movement (
     sedentary_s            integer,
     active_s               integer,
     highly_active_s        integer,
-    resp_waking            real,  -- дыхание днём, вдохов/мин
+    resp_waking            real,  -- waking respiration, breaths/min
     updated_at             timestamptz NOT NULL DEFAULT now()
 );
 CREATE TABLE IF NOT EXISTS garmin.training (
     day             date PRIMARY KEY,
-    readiness_score smallint,     -- готовность к тренировке 0–100
+    readiness_score smallint,     -- training readiness, 0–100
     readiness_level text,
     training_status text,
-    load_acute      real,         -- острая нагрузка (7 дней)
-    load_chronic    real,         -- хроническая нагрузка (28 дней)
+    load_acute      real,         -- acute load (7 days)
+    load_chronic    real,         -- chronic load (28 days)
     load_ratio      real,
     vo2max_run      real,
     vo2max_bike     real,
@@ -323,7 +323,7 @@ CREATE TABLE IF NOT EXISTS garmin.hydration (
     updated_at    timestamptz NOT NULL DEFAULT now()
 );
 
--- ---------- внутри дня ----------
+-- ---------- intraday ----------
 CREATE TABLE IF NOT EXISTS garmin.hr_samples           (ts timestamptz PRIMARY KEY, hr smallint);
 CREATE TABLE IF NOT EXISTS garmin.stress_samples       (ts timestamptz PRIMARY KEY, stress smallint);
 CREATE TABLE IF NOT EXISTS garmin.body_battery_samples (ts timestamptz PRIMARY KEY, level smallint);
@@ -342,7 +342,7 @@ CREATE TABLE IF NOT EXISTS garmin.sleep_stages (
     level    real
 );
 
--- ---------- тренировки ----------
+-- ---------- activities ----------
 CREATE TABLE IF NOT EXISTS garmin.activities (
     activity_id   bigint PRIMARY KEY,
     day           date,
@@ -365,7 +365,7 @@ CREATE TABLE IF NOT EXISTS garmin.activities (
     avg_power     real,
     max_power     real,
     norm_power    real,
-    te_aerobic    real,           -- аэробный эффект
+    te_aerobic    real,           -- aerobic training effect
     te_anaerobic  real,
     training_load real,
     vo2max        real,
@@ -429,13 +429,13 @@ CREATE TABLE IF NOT EXISTS garmin.activity_files (
     downloaded_at timestamptz NOT NULL DEFAULT now()
 );
 
--- ---------- служебное ----------
+-- ---------- utilities ----------
 CREATE TABLE IF NOT EXISTS garmin.sync_state (
     key   text PRIMARY KEY,
     value text NOT NULL
 );
 
--- ---------- представления для выгрузки ----------
+-- ---------- export views ----------
 DROP VIEW IF EXISTS garmin.daily_overview;
 CREATE VIEW garmin.daily_overview AS
 SELECT d.day,
@@ -479,7 +479,7 @@ JOIN garmin.activities a USING (activity_id);
 
 DAY_TABLES = ["sleep", "heart", "stress_energy", "movement", "training", "body", "hydration"]
 
-SAMPLE_TABLES = {  # таблица: (столбцы, ключ)
+SAMPLE_TABLES = {  # table: (columns, key)
     "hr_samples": (["ts", "hr"], ["ts"]),
     "stress_samples": (["ts", "stress"], ["ts"]),
     "body_battery_samples": (["ts", "level"], ["ts"]),
@@ -489,7 +489,7 @@ SAMPLE_TABLES = {  # таблица: (столбцы, ключ)
     "sleep_stages": (["ts_start", "ts_end", "stage", "level"], ["ts_start"]),
 }
 
-ACTIVITY_CHILDREN = {  # таблица: (столбцы, ключ, источник в raw.activity)
+ACTIVITY_CHILDREN = {  # table: (columns, key, source in raw.activity)
     "activity_laps": (["activity_id", "lap_no", "start_utc", "duration_s", "distance_m", "avg_hr", "max_hr",
                        "avg_speed_ms", "elev_gain_m", "calories"], ["activity_id", "lap_no"], "splits"),
     "activity_hr_zones": (["activity_id", "zone", "seconds", "low_bpm"], ["activity_id", "zone"], "hr_zones"),
@@ -518,24 +518,24 @@ def login(interactive: bool):
         return g
     except Exception as e:
         if not interactive:
-            log(f"Вход по сохранённым токенам не удался ({type(e).__name__}). "
-                "Нужен повторный вход: docker compose run --rm collector python sync.py --login")
+            log(f"Login with saved tokens failed ({type(e).__name__}). "
+                "Log in again: docker compose run --rm collector python sync.py --login")
             sys.exit(1)
     from getpass import getpass
     email = input("Garmin email: ")
-    pwd = getpass("Garmin пароль: ")
-    g = Garmin(email, pwd, prompt_mfa=lambda: input("Код MFA: "))
+    pwd = getpass("Garmin password: ")
+    g = Garmin(email, pwd, prompt_mfa=lambda: input("MFA code: "))
     g.login(TOKENS)
-    try:  # на случай версии библиотеки, которая не сохраняет токены сама
+    try:  # for library versions that do not save tokens automatically
         g.garth.dump(TOKENS)
     except Exception:
         pass
-    log("Вход выполнен, токены сохранены в /tokens")
+    log("Logged in; tokens saved to /tokens")
     return g
 
 
 class Api:
-    """Обёртка над garminconnect: паузы, распознавание лимита 429, по одному предупреждению на ошибку за проход."""
+    """garminconnect wrapper: delays, HTTP 429 detection, and one warning per error per run."""
 
     def __init__(self, g):
         self.g = g
@@ -546,7 +546,7 @@ class Api:
         m = getattr(self.g, method, None)
         if m is None:
             if method not in self.warned:
-                log(f"  метод {method} недоступен в этой версии garminconnect — пропускаю «{label}»")
+                log(f"  method {method} is unavailable in this garminconnect version; skipping «{label}»")
                 self.warned.add(method)
             return None
         time.sleep(PAUSE_CALL)
@@ -564,7 +564,7 @@ class Api:
             return None
 
 
-# имя в raw.daily: метод garminconnect (все принимают дату 'ГГГГ-ММ-ДД')
+# raw.daily endpoint name: garminconnect method (all accept a 'YYYY-MM-DD' date)
 DAY_ENDPOINTS = {
     "user_summary": "get_user_summary",
     "heart_rates": "get_heart_rates",
@@ -593,25 +593,25 @@ def fetch_day(api: Api, day: str) -> dict[str, Any]:
 
 def fetch_activity(api: Api, aid: int, item: dict) -> dict[str, Any]:
     raw: dict[str, Any] = {"list": item}
-    raw["summary"] = api.call("тренировка", "get_activity", aid)
-    raw["splits"] = api.call("круги", "get_activity_splits", aid)
-    raw["hr_zones"] = api.call("пульсовые зоны", "get_activity_hr_in_timezones", aid)
+    raw["summary"] = api.call("activity", "get_activity", aid)
+    raw["splits"] = api.call("laps", "get_activity_splits", aid)
+    raw["hr_zones"] = api.call("heart rate zones", "get_activity_hr_in_timezones", aid)
     typ = dig(item, "activityType", "typeKey") or ""
     if typ in STRENGTH_TYPES or item.get("totalSets") or item.get("activeSets"):
-        raw["exercise_sets"] = api.call("подходы", "get_activity_exercise_sets", aid)
-    raw["details"] = api.call("данные тренировки", "get_activity_details", aid)
+        raw["exercise_sets"] = api.call("exercise sets", "get_activity_exercise_sets", aid)
+    raw["details"] = api.call("activity details", "get_activity_details", aid)
     return raw
 
 
 # =====================================================================
-# разбор ответов Garmin
+# parse Garmin responses
 # =====================================================================
 
 SLEEP_STAGE = {0: "deep", 1: "light", 2: "rem", 3: "awake"}
 
 
 def latest_entry(v: Any) -> Any:
-    """Из списка записей за день берём последнюю по времени (готовность к тренировке пересчитывается в течение дня)."""
+    """Select the latest entry for the day (training readiness is recalculated throughout the day)."""
     if isinstance(v, list):
         items = [x for x in v if isinstance(x, dict)]
         if not items:
@@ -821,7 +821,7 @@ def parse_activity(aid: int, raw: dict[str, Any]) -> tuple[dict, dict[str, list[
         "device_id": to_int(f("deviceId")),
     }
 
-    children: dict[str, list[tuple] | None] = {k: None for k in ACTIVITY_CHILDREN}  # None = источника нет, не трогаем
+    children: dict[str, list[tuple] | None] = {k: None for k in ACTIVITY_CHILDREN}  # None = source unavailable; leave existing data unchanged
 
     if raw.get("splits") is not None:
         laps = []
@@ -881,7 +881,7 @@ def parse_activity(aid: int, raw: dict[str, Any]) -> tuple[dict, dict[str, list[
 
 
 # =====================================================================
-# запись в базу
+# database writes
 # =====================================================================
 
 def upsert(cur, table: str, cols: list[str], keys: list[str], rows: Iterable[tuple], stamp: bool = False) -> None:
@@ -922,7 +922,7 @@ def write_activity(cur, aid: int, raw: dict[str, Any]) -> dict:
     upsert(cur, "garmin.activities", list(row), ["activity_id"], [tuple(row.values())], stamp=True)
     for table, data in children.items():
         if data is None:
-            continue  # этот запрос не удался — оставляем прежние строки
+            continue  # request failed; keep existing rows
         cols, keys, _ = ACTIVITY_CHILDREN[table]
         cur.execute(f"DELETE FROM garmin.{table} WHERE activity_id = %s", (aid,))
         upsert(cur, f"garmin.{table}", cols, keys, data)
@@ -955,7 +955,7 @@ def set_state(conn, key: str, value: str) -> None:
 
 
 def history_start(conn) -> dt.date:
-    """Откуда начинать при первом запуске версии 2: самый ранний день в базе или BACKFILL_FROM."""
+    """Start the first version 2 run at the earliest database date or BACKFILL_FROM."""
     with conn.cursor() as cur:
         cur.execute("SELECT min(day) FROM raw.daily")
         r = cur.fetchone()
@@ -972,32 +972,32 @@ def window_start(conn, key: str) -> dt.date:
 
 
 # =====================================================================
-# сбор
+# data collection
 # =====================================================================
 
 def with_rate_limit(fn, what: str):
-    """Один повтор после паузы при ошибке 429. При повторной — RateLimited наверх."""
+    """Retry once after a delay on HTTP 429. Propagate RateLimited if the retry fails."""
     try:
         return fn()
     except RateLimited:
-        log(f"Garmin ограничил частоту запросов ({what}) — пауза {RATE_LIMIT_WAIT // 60} минут")
+        log(f"Garmin rate limit ({what}); waiting {RATE_LIMIT_WAIT // 60} minutes")
         time.sleep(RATE_LIMIT_WAIT)
         return fn()
 
 
 def sync_days(api: Api, conn) -> bool:
-    """Возвращает False, если упёрлись в лимит Garmin."""
+    """Return False if the Garmin rate limit is reached."""
     day = window_start(conn, "days_done_until")
     today = now().date()
     total = (today - day).days + 1
-    log(f"Дни: {day} … {today} ({total} дн.)")
+    log(f"Days: {day} … {today} ({total} days)")
     done = 0
     while day <= today:
         ds = day.isoformat()
         try:
             raw = with_rate_limit(lambda: fetch_day(api, ds), ds)
         except RateLimited:
-            log("Снова ограничение — прерываю, продолжу со следующего прохода с этого же места")
+            log("Rate limit reached again; stopping and resuming from this point on the next run")
             return False
         save_day(conn, ds, raw)
         set_state(conn, "days_done_until", ds)
@@ -1006,7 +1006,7 @@ def sync_days(api: Api, conn) -> bool:
             log(f"  … {done}/{total}")
         day += dt.timedelta(days=1)
         time.sleep(PAUSE_DAY)
-    log(f"Дни: готово {done}")
+    log(f"Days: completed {done}")
     return True
 
 
@@ -1018,8 +1018,8 @@ def download_fit(api: Api, conn, aid: int, row: dict) -> None:
     if r and (fit_dir / r[0]).exists():
         return
     fmt = getattr(getattr(type(api.g), "ActivityDownloadFormat", None), "ORIGINAL", None)
-    data = (api.call("FIT-файл", "download_activity", aid, dl_fmt=fmt) if fmt is not None
-            else api.call("FIT-файл", "download_activity", aid))
+    data = (api.call("FIT file", "download_activity", aid, dl_fmt=fmt) if fmt is not None
+            else api.call("FIT file", "download_activity", aid))
     if not data:
         return
     fit_dir.mkdir(parents=True, exist_ok=True)
@@ -1035,10 +1035,10 @@ def sync_activities(api: Api, conn) -> bool:
     start = window_start(conn, "activities_done_until")
     today = now().date()
     try:
-        items = with_rate_limit(lambda: api.call("список тренировок", "get_activities_by_date",
-                                                 start.isoformat(), today.isoformat()), "список тренировок")
+        items = with_rate_limit(lambda: api.call("activity list", "get_activities_by_date",
+                                                 start.isoformat(), today.isoformat()), "activity list")
     except RateLimited:
-        log("Тренировки: ограничение Garmin — пропускаю до следующего прохода")
+        log("Activities: Garmin rate limit; skipping until the next run")
         return False
     items = sorted([i for i in items or [] if isinstance(i, dict) and i.get("activityId")],
                    key=lambda i: str(i.get("startTimeLocal") or ""))
@@ -1046,7 +1046,7 @@ def sync_activities(api: Api, conn) -> bool:
         cur.execute("SELECT activity_id FROM garmin.activities")
         known = {int(r[0]) for r in cur.fetchall()}
     fresh_from = today - dt.timedelta(days=RESYNC_DAYS)
-    log(f"Тренировки: {start} … {today}, найдено {len(items)}")
+    log(f"Activities: {start} … {today}, found {len(items)}")
     loaded = 0
     for item in items:
         aid = int(item["activityId"])
@@ -1056,25 +1056,25 @@ def sync_activities(api: Api, conn) -> bool:
             set_state(conn, "activities_done_until", day.isoformat())
             continue
         try:
-            raw = with_rate_limit(lambda: fetch_activity(api, aid, item), f"тренировка {aid}")
+            raw = with_rate_limit(lambda: fetch_activity(api, aid, item), f"activity {aid}")
             row = save_activity(conn, aid, raw)
             if DOWNLOAD_FIT:
                 with_rate_limit(lambda: download_fit(api, conn, aid, row), f"FIT {aid}")
         except RateLimited:
-            log("Снова ограничение — прерываю, продолжу со следующего прохода с этого же места")
+            log("Rate limit reached again; stopping and resuming from this point on the next run")
             return False
         set_state(conn, "activities_done_until", day.isoformat())
         loaded += 1
         if loaded % 20 == 0:
-            log(f"  … {loaded} тренировок")
+            log(f"  … {loaded} activities")
         time.sleep(PAUSE_ACTIVITY)
     set_state(conn, "activities_done_until", today.isoformat())
-    log(f"Тренировки: загружено {loaded}")
+    log(f"Activities: loaded {loaded}")
     return True
 
 
 # =====================================================================
-# выгрузка в CSV, бэкап, Google Drive
+# CSV export, backup, Google Drive
 # =====================================================================
 
 EXPORTS = [
@@ -1100,7 +1100,7 @@ EXPORTS = [
 
 
 def cell(v: Any) -> Any:
-    """Время — по Москве без смещения, чтобы Google Таблицы и Excel распознавали его как дату."""
+    """Export Moscow time without an offset so Google Sheets and Excel recognize it as a date."""
     if v is None:
         return ""
     if isinstance(v, dt.datetime):
@@ -1121,12 +1121,12 @@ def export_csv(conn) -> None:
             cur.execute(sql)
             header = [d[0] for d in cur.description]
             rows = cur.fetchall()
-        with tmp.open("w", encoding="utf-8-sig", newline="") as f:  # BOM — для кириллицы в Excel
+        with tmp.open("w", encoding="utf-8-sig", newline="") as f:  # BOM for Cyrillic text in Excel
             w = csv.writer(f)
             w.writerow(header)
             w.writerows([cell(v) for v in r] for r in rows)
         tmp.replace(path)
-    log(f"CSV: {len(EXPORTS)} файлов → {OUT}")
+    log(f"CSV: {len(EXPORTS)} files → {OUT}")
 
 
 def backup() -> Path | None:
@@ -1134,36 +1134,36 @@ def backup() -> Path | None:
     name = DUMPS / f"garmin_{now():%Y%m%d_%H%M}.sql.gz"
     r = subprocess.run(f"pg_dump '{PG_DSN}' | gzip > '{name}'", shell=True, capture_output=True, text=True)
     if r.returncode != 0:
-        log(f"Бэкап: ошибка {r.stderr.strip()[:300]}")
+        log(f"Backup: error {r.stderr.strip()[:300]}")
         return None
     for old in sorted(DUMPS.glob("garmin_*.sql.gz"))[:-KEEP_DUMPS]:
         old.unlink(missing_ok=True)
-    log(f"Бэкап: {name.name}")
+    log(f"Backup: {name.name}")
     return name
 
 
 def rclone(*args: str) -> bool:
     r = subprocess.run(["rclone", *args], capture_output=True, text=True)
     if r.returncode != 0:
-        log(f"Google Drive: ошибка rclone {args[0]}: {r.stderr.strip()[:300]}")
+        log(f"Google Drive: rclone error {args[0]}: {r.stderr.strip()[:300]}")
     return r.returncode == 0
 
 
 def upload(dump: Path | None) -> None:
     if not RCLONE_REMOTE:
-        log("Google Drive: не настроен (RCLONE_REMOTE пуст) — пропускаю")
+        log("Google Drive: not configured (RCLONE_REMOTE is empty); skipping")
         return
-    # CSV и FIT-файлы; rclone copy отправляет только изменившиеся файлы
+    # CSV and FIT files; rclone copy transfers only changed files
     ok = rclone("copy", str(OUT), RCLONE_REMOTE, "--exclude", "*.tmp", "--exclude", "garmin_health.json")
     if dump:
         ok &= rclone("copyto", str(dump), f"{RCLONE_REMOTE}/backups/{dump.name}")
         rclone("delete", f"{RCLONE_REMOTE}/backups", "--min-age", f"{KEEP_DUMPS}d")
     if ok:
-        log("Google Drive: таблицы, FIT-файлы и бэкап загружены")
+        log("Google Drive: tables, FIT files, and backup uploaded")
 
 
 # =====================================================================
-# проход, пересборка, расписание
+# sync run, rebuild, scheduling
 # =====================================================================
 
 def connect():
@@ -1182,12 +1182,12 @@ def run_once() -> None:
         if sync_days(api, conn):
             sync_activities(api, conn)
         export_csv(conn)
-    log(f"Проход: {api.calls} запросов к Garmin, {round((time.time() - t0) / 60, 1)} мин")
+    log(f"Run: {api.calls} Garmin requests, {round((time.time() - t0) / 60, 1)} min")
     upload(backup())
 
 
 def reparse() -> None:
-    """Пересобирает garmin.* из raw.* — например, после исправления разбора. К Garmin не обращается."""
+    """Rebuild garmin.* from raw.*, for example after parser fixes. Does not contact Garmin."""
     with connect() as conn:
         ensure_schema(conn)
         with conn.cursor() as cur:
@@ -1208,7 +1208,7 @@ def reparse() -> None:
             for aid, raw in by_act.items():
                 write_activity(cur, aid, raw)
         conn.commit()
-        log(f"Пересборка: {len(by_day)} дн., {len(by_act)} тренировок")
+        log(f"Rebuild: {len(by_day)} days, {len(by_act)} activities")
         export_csv(conn)
 
 
@@ -1227,28 +1227,28 @@ def safe_run() -> None:
     try:
         run_once()
     except SystemExit:
-        # нет токенов или вход не удался — не перезапускаем контейнер в цикле, ждём следующего запуска
-        log("Проход пропущен: нужен вход в Garmin (см. сообщение выше)")
+        # tokens are missing or login failed; wait for the next run instead of restarting the container in a loop
+        log("Run skipped: Garmin login required (see message above)")
     except Exception as e:
-        log(f"Ошибка прохода: {type(e).__name__}: {e}")
+        log(f"Run error: {type(e).__name__}: {e}")
 
 
 def service() -> None:
-    log(f"Служба запущена (версия 2), расписание: {', '.join(RUN_TIMES)} ({TZ.key})")
+    log(f"Service started (version 2), schedule: {', '.join(RUN_TIMES)} ({TZ.key})")
     if os.environ.get("RUN_ON_START", "1") == "1":
         safe_run()
     while True:
         nxt = next_run(now())
-        log(f"Следующий запуск: {nxt:%Y-%m-%d %H:%M}")
+        log(f"Next run: {nxt:%Y-%m-%d %H:%M}")
         time.sleep(max(1, (nxt - now()).total_seconds()))
         safe_run()
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--login", action="store_true", help="интерактивный вход в Garmin")
-    ap.add_argument("--once", action="store_true", help="один проход и выход")
-    ap.add_argument("--reparse", action="store_true", help="пересобрать таблицы из raw.* без запросов к Garmin")
+    ap.add_argument("--login", action="store_true", help="interactive Garmin login")
+    ap.add_argument("--once", action="store_true", help="run once and exit")
+    ap.add_argument("--reparse", action="store_true", help="rebuild tables from raw.* without Garmin requests")
     a = ap.parse_args()
     if a.login:
         login(interactive=True)

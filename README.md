@@ -1,86 +1,93 @@
-# Garmin → PostgreSQL → Google Drive (Docker на Mac mini)
+# Garmin → PostgreSQL → Google Drive (Docker on Mac mini)
 
-Сборщик дважды в сутки (09:00 и 22:00 МСК) забирает из Garmin Connect **все** данные:
-суточные показатели, данные внутри дня и тренировки с подходами и FIT-файлами.
-Пишет их в PostgreSQL, выгружает CSV и FIT в Google Drive и делает бэкап базы.
+The collector retrieves **all** data from Garmin Connect twice a day (09:00 and 22:00 Moscow time):
+daily metrics, intraday samples, and activities with exercise sets and FIT files.
+It stores the data in PostgreSQL, exports CSV and FIT files to Google Drive, and backs up the database.
 
-## Как устроена база
+## Database layout
 
-| Схема | Что лежит | Зачем |
+| Schema | Contents | Purpose |
 |---|---|---|
-| `raw` | Ответы Garmin как есть (jsonb): `raw.daily` — по дням, `raw.activity` — по тренировкам | Источник истины. Из него пересобирается всё остальное без повторных запросов к Garmin (`--reparse`) |
-| `garmin` | Разобранные таблицы и представления | Для анализа и выгрузки |
-| `legacy` | Таблицы версии 1 (`daily_metrics`, `sync_state`) | Переносятся сюда автоматически; удалить после проверки |
+| `raw` | Unmodified Garmin responses (jsonb): `raw.daily` for daily data, `raw.activity` for activities | Source of truth. All other tables can be rebuilt without additional Garmin requests (`--reparse`) |
+| `garmin` | Parsed tables and views | Analysis and export |
+| `legacy` | Version 1 tables (`daily_metrics`, `sync_state`) | Moved here automatically; can be removed after verification |
 
-**По дням** — одна строка на день, ключ `day`:
+**Daily metrics** — one row per day, keyed by `day`:
 
-| Таблица | Показатели |
+| Table | Metrics |
 |---|---|
-| `garmin.sleep` | начало и конец сна, фазы (глубокий, лёгкий, REM, бодрствование), оценка, стресс и пульс во сне, дыхание, SpO2 |
-| `garmin.heart` | пульс покоя (день и 7 дней), мин/макс пульс, HRV за ночь, за 7 дней, статус и коридор нормы |
-| `garmin.stress_energy` | стресс (средний, макс, время по уровням), Body Battery (макс, мин, при пробуждении, заряд, расход) |
-| `garmin.movement` | шаги и цель, дистанция, этажи, калории (всего, активные, базовые), минуты интенсивности, время активности, дыхание днём |
-| `garmin.training` | готовность к тренировке, тренировочный статус, острая и хроническая нагрузка, МПК бег/вело, фитнес-возраст, выносливость |
-| `garmin.body` | вес, ИМТ, жир, мышцы, кости, вода |
-| `garmin.hydration` | выпито воды, цель, потеря с потом |
+| `garmin.sleep` | Sleep start and end, stages (deep, light, REM, awake), score, sleep stress and heart rate, respiration, SpO2 |
+| `garmin.heart` | Resting heart rate (daily and 7-day average), minimum/maximum heart rate, nightly and weekly HRV, status and baseline range |
+| `garmin.stress_energy` | Stress (average, maximum, time by level), Body Battery (maximum, minimum, at wake-up, charged, drained) |
+| `garmin.movement` | Steps and goal, distance, floors, calories (total, active, basal), intensity minutes, activity time, waking respiration |
+| `garmin.training` | Training readiness, training status, acute and chronic load, running/cycling VO2 max, fitness age, endurance |
+| `garmin.body` | Weight, BMI, body fat, muscle mass, bone mass, body water |
+| `garmin.hydration` | Water intake, goal, sweat loss |
 
-**Внутри дня** — ключ «время»: `hr_samples` (пульс), `stress_samples`, `body_battery_samples`,
-`respiration_samples`, `hrv_samples` (HRV ночью), `steps_15min`, `sleep_stages`.
+**Intraday samples** — keyed by timestamp: `hr_samples` (heart rate), `stress_samples`,
+`body_battery_samples`, `respiration_samples`, `hrv_samples` (nightly HRV), `steps_15min`, `sleep_stages`.
 
-**Тренировки** — ключ `activity_id`:
+**Activities** — keyed by `activity_id`:
 
-| Таблица | Что |
+| Table | Contents |
 |---|---|
-| `garmin.activities` | одна строка на тренировку: тип, время, длительность, дистанция, пульс, темп, каденс, мощность, набор высоты, эффект, нагрузка |
-| `garmin.activity_laps` | круги и отрезки |
-| `garmin.activity_hr_zones` | время в пульсовых зонах |
-| `garmin.strength_sets` | подходы силовых: упражнение, повторы, вес (кг), отдых |
-| `garmin.activity_samples` | посекундные данные: пульс, скорость, каденс, мощность, высота, координаты |
-| `garmin.activity_files` | скачанные FIT-файлы |
+| `garmin.activities` | One row per activity: type, time, duration, distance, heart rate, speed, cadence, power, elevation gain, training effect, load |
+| `garmin.activity_laps` | Laps and splits |
+| `garmin.activity_hr_zones` | Time in heart rate zones |
+| `garmin.strength_sets` | Strength sets: exercise, repetitions, weight (kg), rest |
+| `garmin.activity_samples` | Second-by-second data: heart rate, speed, cadence, power, elevation, coordinates |
+| `garmin.activity_files` | Downloaded FIT files |
 
-**Представления для выгрузки:** `garmin.daily_overview` (все суточные таблицы в одну строку на день
-плюс число тренировок), `garmin.strength_log` (подходы с датой и названием тренировки).
+**Export views:** `garmin.daily_overview` combines all daily tables into one row per day,
+including activity counts. `garmin.strength_log` includes exercise sets with activity dates and names.
 
-Связи: дочерние таблицы тренировок ссылаются на `garmin.activities` (`ON DELETE CASCADE`).
-Время хранится в `timestamptz`, в CSV выводится по Москве.
+Activity child tables reference `garmin.activities` with `ON DELETE CASCADE`.
+Timestamps are stored as `timestamptz` and exported to CSV in Moscow time.
 
-## Что попадает в Google Drive (папка `RCLONE_REMOTE`)
+## Google Drive output (`RCLONE_REMOTE` folder)
 
-```
+```text
 garmin_daily_metrics.csv        ← garmin.daily_overview
 garmin_activities.csv
 garmin_strength_sets.csv        ← garmin.strength_log
 activities/  garmin_activity_laps.csv, garmin_activity_hr_zones.csv, garmin_activity_samples.csv
 intraday/    garmin_hr.csv, garmin_stress.csv, garmin_body_battery.csv, garmin_respiration.csv,
              garmin_hrv_night.csv, garmin_steps_15min.csv, garmin_sleep_stages.csv
-fit/         исходные файлы тренировок с часов (zip с FIT)
-backups/     pg_dump за последние 14 дней
+fit/         original activity files from the watch (ZIP archives containing FIT files)
+backups/     pg_dump backups for the last 14 days
 ```
 
-## Как идёт загрузка
+## Sync behavior
 
-- Первый запуск версии 2 заново проходит всю историю: с самого раннего дня в базе (или `BACKFILL_FROM`).
-  Около 17 запросов на день и до 6 на тренировку, с паузами. За 90 дней — порядка 20–40 минут.
-- Дальше каждый проход перечитывает последние `RESYNC_DAYS` дней и тренировки за эти дни:
-  Garmin досинхронизирует с опозданием, а веса в подходах можно поправить задним числом.
-- Ошибка 429 (слишком много запросов): пауза 10 минут, затем проход прерывается
-  и следующий продолжает с того же места.
-- Если какого-то показателя нет (например, нет весов), это не ошибка: в журнале одна строка, поле пустое.
+- The first version 2 run reprocesses the entire history, starting at the earliest day in the database
+  (or `BACKFILL_FROM`). Approximately 17 requests per day and up to 6 per activity, with delays.
+  A 90-day history takes approximately 20–40 minutes.
+- Subsequent runs reload the most recent `RESYNC_DAYS` days and their activities:
+  Garmin may sync data with a delay, and set weights can be edited retroactively.
+- HTTP 429 (too many requests): wait 10 minutes, then stop the run;
+  the next run resumes from the same point.
+- Missing metrics (for example, when no scale is connected) are not treated as errors:
+  a single log entry is written and the field remains empty.
 
-## Команды
+## Commands
 
 ```bash
-docker compose up -d --build                               # запуск / обновление
-docker compose run --rm collector python sync.py --login   # вход в Garmin (email, пароль, код MFA)
-docker compose run --rm collector python sync.py --once    # один проход вручную
-docker compose run --rm collector python sync.py --reparse # пересобрать таблицы из raw.*, без Garmin
-tail -f logs/sync.log                                      # журнал
+docker compose up -d --build                               # start / update
+docker compose run --rm collector python sync.py --login   # Garmin login (email, password, MFA code)
+docker compose run --rm collector python sync.py --once    # run once manually
+docker compose run --rm collector python sync.py --reparse # rebuild tables from raw.*, without Garmin requests
+tail -f logs/sync.log                                      # view the log
 ```
 
-## Доступ к базе с Mac mini
+## Database access from Mac mini
 
-`psql postgresql://garmin:<PG_PASSWORD из .env>@127.0.0.1:5432/garmin`
+Use `PG_PASSWORD` from `.env`:
 
-## Секреты — никуда не выкладывать
+```text
+psql postgresql://garmin:<PG_PASSWORD>@127.0.0.1:5432/garmin
+```
 
-`.env`, `tokens/` (токены Garmin), `rclone/` (доступ к Google Drive). Всё это в `.gitignore`.
+## Configuration
+
+`.env` contains the database password, `tokens/` stores Garmin authentication tokens,
+and `rclone/` contains Google Drive connection settings. These paths are excluded through `.gitignore`.

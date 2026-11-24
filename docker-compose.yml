@@ -1,7 +1,7 @@
-# Garmin → PostgreSQL на Mac mini.
-# Запуск:        docker compose up -d --build
-# Первый вход:   docker compose run --rm collector python sync.py --login
-# Логи:          tail -f logs/sync.log
+# Garmin → PostgreSQL on Mac mini.
+# Start:        docker compose up -d --build
+# Initial login:   docker compose run --rm collector python sync.py --login
+# Logs:          tail -f logs/sync.log
 services:
   postgres:
     image: postgres:16
@@ -15,7 +15,7 @@ services:
       - pgdata:/var/lib/postgresql/data
       - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
     ports:
-      - "127.0.0.1:5432:5432"   # доступ только с самого Mac mini (PyCharm, psql)
+      - "127.0.0.1:5432:5432"   # accessible only from the Mac mini itself (PyCharm, psql)
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U garmin -d garmin"]
       interval: 10s
@@ -40,11 +40,11 @@ services:
       KEEP_DUMPS: ${KEEP_DUMPS:-14}
       DOWNLOAD_FIT: ${DOWNLOAD_FIT:-1}
     volumes:
-      - ./tokens:/tokens          # токены Garmin (секрет! не выкладывать)
-      - ./out:/out                # CSV и FIT-файлы для Google Drive
-      - ./dumps:/dumps            # pg_dump после каждого прохода
+      - ./tokens:/tokens          # Garmin tokens (secret; do not publish)
+      - ./out:/out                # CSV and FIT files for Google Drive
+      - ./dumps:/dumps            # pg_dump after each run
       - ./logs:/logs
-      - ./rclone:/config/rclone   # настройки rclone для Google Drive (секрет!)
+      - ./rclone:/config/rclone   # rclone configuration for Google Drive (secret)
 
 volumes:
   pgdata:
