@@ -1,5 +1,7 @@
 # Development plan
 
+English | [Русский](ROADMAP.ru.md)
+
 Each item is implemented in a separate commit. This document describes planned work;
 the current application does not yet implement the setup flow below.
 

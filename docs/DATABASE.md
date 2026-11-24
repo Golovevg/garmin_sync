@@ -1,5 +1,7 @@
 # PostgreSQL data dictionary
 
+English | [Русский](ru/DATABASE.md)
+
 This catalog follows `SCHEMA_SQL` in `collector/sync.py`. It documents the current implementation, not planned behavior.
 
 All columns, types, inline constraints, and table primary keys below are extracted from the source schema. A primary key implies `NOT NULL`; otherwise columns are nullable unless stated. No range checks or multi-user isolation are defined. The only explicit secondary index is `activities_day_idx` on `garmin.activities(day)`. PostgreSQL also creates indexes for primary keys.

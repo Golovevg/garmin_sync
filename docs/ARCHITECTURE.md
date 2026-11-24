@@ -1,5 +1,7 @@
 # Application architecture and operation
 
+English | [Русский](ru/ARCHITECTURE.md)
+
 This document describes the code imported as v2 and its English translation. Planned credential
 setup and reliability fixes are tracked in [ROADMAP.md](../ROADMAP.md); they are not implemented yet.
 

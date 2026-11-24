@@ -1,5 +1,7 @@
 # Garmin inputs and exported files
 
+English | [Русский](ru/ENDPOINTS_AND_EXPORTS.md)
+
 ## Daily endpoints
 
 `fetch_day()` calls these methods sequentially with an ISO date. Availability depends on the

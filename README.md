@@ -1,4 +1,6 @@
-# Garmin → PostgreSQL → Google Drive (Docker on Mac mini)
+# Garmin → PostgreSQL → Google Drive (Docker on a local computer or server)
+
+English | [Русский](README.ru.md)
 
 The collector retrieves the configured data categories from Garmin Connect twice a day (09:00 and 22:00 Moscow time):
 daily metrics, intraday samples, and activities with exercise sets and FIT files.
@@ -87,7 +89,7 @@ docker compose run --rm collector python sync.py --reparse # rebuild tables from
 tail -f logs/sync.log                                      # view the log
 ```
 
-## Database access from Mac mini
+## Database access from the local computer or server
 
 Use `PG_PASSWORD` from `.env`:
 
